@@ -4,8 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0
 */
 import React, { useRef, useEffect, useState } from 'react';
-import {ArrowPathIcon, PlusIcon, SparklesIcon, TvIcon, FilmIcon} from './icons';
-import {GroundingSource} from '../types';
+import {ArrowPathIcon, PlusIcon, SparklesIcon, TvIcon, FilmIcon, TvIcon as YoutubeIcon, XMarkIcon} from './icons';
+import {GroundingSource, YouTubeMetadata} from '../types';
+import YouTubeUploadModal from './YouTubeUploadModal';
 
 interface VideoResultProps {
   videoUrl?: string;
@@ -13,6 +14,7 @@ interface VideoResultProps {
   thumbnailUrl?: string;
   audioUrl?: string;
   sources?: GroundingSource[];
+  youtubeMetadata?: YouTubeMetadata;
   onRetry: () => void;
   onNewVideo: () => void;
   onExtend: () => void;
@@ -25,6 +27,7 @@ const VideoResult: React.FC<VideoResultProps> = ({
   thumbnailUrl,
   audioUrl,
   sources,
+  youtubeMetadata,
   onRetry,
   onNewVideo,
   onExtend,
@@ -33,243 +36,270 @@ const VideoResult: React.FC<VideoResultProps> = ({
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  
   const [currentSlide, setCurrentSlide] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
+  const [exportStatus, setExportStatus] = useState("");
   const [exportedVideoUrl, setExportedVideoUrl] = useState<string | null>(null);
+  const [exportedBlob, setExportedBlob] = useState<Blob | null>(null);
+  const [showYoutubeModal, setShowYoutubeModal] = useState(false);
 
-  // Slideshow Timing Logic
+  // Sync slides with audio playback
   useEffect(() => {
-    if (slideshowImages.length > 0 && audioUrl) {
+    if (slideshowImages.length > 0 && audioUrl && isPlaying) {
       const audio = audioRef.current;
       if (!audio) return;
 
       const updateSlide = () => {
-        if (audio.duration) {
+        if (audio.duration && audio.duration > 0) {
           const progress = audio.currentTime / audio.duration;
           const index = Math.min(
             Math.floor(progress * slideshowImages.length),
             slideshowImages.length - 1
           );
-          setCurrentSlide(index);
+          if (index !== currentSlide) setCurrentSlide(index);
         }
       };
 
       audio.addEventListener('timeupdate', updateSlide);
       return () => audio.removeEventListener('timeupdate', updateSlide);
     }
-  }, [slideshowImages, audioUrl]);
+  }, [slideshowImages, audioUrl, isPlaying, currentSlide]);
 
-  // Sync logic for Pro Mode
-  useEffect(() => {
-    const video = videoRef.current;
-    const audio = audioRef.current;
-    if (!video || !audio) return;
-
-    const syncPlayback = () => {
-      if (video.paused) audio.pause();
-      else audio.play().catch(() => {});
-    };
-
-    const syncTime = () => {
-      if (Math.abs(video.currentTime - audio.currentTime) > 0.2) {
-        audio.currentTime = video.currentTime;
-      }
-    };
-
-    video.addEventListener('play', syncPlayback);
-    video.addEventListener('pause', syncPlayback);
-    video.addEventListener('timeupdate', syncTime);
-
-    return () => {
-      video.removeEventListener('play', syncPlayback);
-      video.removeEventListener('pause', syncPlayback);
-      video.removeEventListener('timeupdate', syncTime);
-    };
-  }, [audioUrl, videoUrl]);
+  const togglePlayback = () => {
+    if (!audioRef.current) return;
+    if (isPlaying) {
+      audioRef.current.pause();
+      setIsPlaying(false);
+    } else {
+      audioRef.current.play()
+        .then(() => setIsPlaying(true))
+        .catch((err) => {
+          console.error("Playback failed:", err);
+          alert("Interaction required: Please click the play button to enable audio.");
+        });
+    }
+  };
 
   const handleExportHD = async () => {
     if (!audioUrl || slideshowImages.length === 0 || !canvasRef.current) return;
     
-    setIsExporting(true);
-    setExportProgress(0);
-    
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d')!;
-    canvas.width = 1920; // 1080p
-    canvas.height = 1080;
-    
-    const audio = new Audio(audioUrl);
-    await audio.play();
-    
-    const stream = canvas.captureStream(30);
-    const mediaRecorder = new MediaRecorder(stream, { mimeType: 'video/webm;codecs=vp9' });
-    const chunks: Blob[] = [];
-    
-    mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
-    mediaRecorder.onstop = () => {
-      const blob = new Blob(chunks, { type: 'video/webm' });
-      setExportedVideoUrl(URL.createObjectURL(blob));
-      setIsExporting(false);
-      audio.pause();
-    };
+    try {
+      setIsExporting(true);
+      setExportProgress(0);
+      setExportStatus("Loading production assets...");
+      
+      // Pre-load images to avoid flickers during export
+      const bitmaps: ImageBitmap[] = await Promise.all(
+        slideshowImages.map(async (src, i) => {
+          setExportStatus(`Caching scene ${i + 1}/${slideshowImages.length}...`);
+          const response = await fetch(src);
+          const blob = await response.blob();
+          return await createImageBitmap(blob);
+        })
+      );
 
-    mediaRecorder.start();
+      const canvas = canvasRef.current;
+      const ctx = canvas.getContext('2d', { alpha: false })!;
+      canvas.width = 1920; 
+      canvas.height = 1080;
+      
+      const exportAudio = new Audio(audioUrl);
+      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const sourceNode = audioContext.createMediaElementSource(exportAudio);
+      const destination = audioContext.createMediaStreamDestination();
+      sourceNode.connect(destination);
 
-    const renderFrame = () => {
-      if (audio.paused || audio.ended) {
-        mediaRecorder.stop();
-        return;
-      }
+      // Start audio specifically for recorder context
+      await exportAudio.play();
+      
+      const EXPORT_FPS = 15; 
+      const videoStream = canvas.captureStream(EXPORT_FPS);
+      const audioTrack = destination.stream.getAudioTracks()[0];
+      if (audioTrack) videoStream.addTrack(audioTrack);
 
-      const progress = audio.currentTime / audio.duration;
-      const index = Math.min(Math.floor(progress * slideshowImages.length), slideshowImages.length - 1);
-      const img = new Image();
-      img.src = slideshowImages[index];
-      img.onload = () => {
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        setExportProgress(Math.floor(progress * 100));
-        requestAnimationFrame(renderFrame);
+      const mimeType = 'video/webm;codecs=vp9,opus';
+      const recorderOptions = { 
+        mimeType: MediaRecorder.isTypeSupported(mimeType) ? mimeType : 'video/webm',
+        videoBitsPerSecond: 12000000 // 12Mbps for extreme clarity
       };
-    };
+      
+      const mediaRecorder = new MediaRecorder(videoStream, recorderOptions);
+      const chunks: Blob[] = [];
 
-    renderFrame();
-  };
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
 
-  const handleDownloadThumbnail = () => {
-    if (!thumbnailUrl) return;
-    const link = document.createElement('a');
-    link.href = thumbnailUrl;
-    link.download = 'tutorial_thumbnail_hd.png';
-    link.click();
+      mediaRecorder.onstop = () => {
+        const finalBlob = new Blob(chunks, { type: 'video/webm' });
+        setExportedBlob(finalBlob);
+        setExportedVideoUrl(URL.createObjectURL(finalBlob));
+        setIsExporting(false);
+        exportAudio.pause();
+        audioContext.close();
+        bitmaps.forEach(b => b.close());
+      };
+
+      mediaRecorder.start();
+
+      const renderLoop = () => {
+        if (exportAudio.paused || exportAudio.ended) {
+          if (mediaRecorder.state === 'recording') mediaRecorder.stop();
+          return;
+        }
+
+        const progress = exportAudio.currentTime / exportAudio.duration;
+        const index = Math.min(Math.floor(progress * bitmaps.length), bitmaps.length - 1);
+        
+        ctx.drawImage(bitmaps[index], 0, 0, canvas.width, canvas.height);
+        
+        setExportProgress(Math.floor(progress * 100));
+        setExportStatus(`Rendering Master Copy: ${Math.floor(exportAudio.currentTime)}s / ${Math.floor(exportAudio.duration)}s`);
+        requestAnimationFrame(renderLoop);
+      };
+
+      renderLoop();
+    } catch (err) {
+      console.error("Export failed:", err);
+      setIsExporting(false);
+      alert("Export failed. Ensure you are using a modern desktop browser for large file renders.");
+    }
   };
 
   return (
-    <div className="w-full flex flex-col items-center gap-6 p-6 bg-gray-900/60 rounded-3xl border border-gray-700 shadow-2xl backdrop-blur-md animate-fade-in overflow-hidden">
+    <div className="w-full flex flex-col items-center gap-6 p-6 bg-gray-900/80 rounded-[2.5rem] border border-gray-700 shadow-2xl backdrop-blur-xl animate-fade-in overflow-hidden">
+      {showYoutubeModal && (
+        <YouTubeUploadModal 
+          videoBlob={exportedBlob || undefined}
+          thumbnailUrl={thumbnailUrl || undefined}
+          metadata={youtubeMetadata}
+          onClose={() => setShowYoutubeModal(false)}
+        />
+      )}
+
       <div className="flex items-center justify-between w-full px-2">
         <div className="flex items-center gap-3">
-          <div className="p-2 bg-indigo-500/20 rounded-lg">
+          <div className="p-2 bg-indigo-500/20 rounded-xl">
             <SparklesIcon className="w-5 h-5 text-indigo-400" />
           </div>
-          <h2 className="text-xl font-bold text-gray-100 italic">
-            {videoUrl ? 'Pro Video Master' : 'Basic Tutorial Master'}
-          </h2>
+          <div>
+            <h2 className="text-xl font-bold text-gray-100 tracking-tight">
+              {videoUrl ? 'Veo Master Cut' : 'Studio Generation Ready'}
+            </h2>
+            <p className="text-[10px] text-gray-500 font-bold uppercase tracking-widest">
+              Production Verified • 1080p Assets
+            </p>
+          </div>
         </div>
-        {thumbnailUrl && (
+        {exportedVideoUrl && (
           <button 
-            onClick={handleDownloadThumbnail}
-            className="text-[10px] px-3 py-1 bg-gray-800 hover:bg-gray-700 rounded-full text-indigo-400 font-bold tracking-tighter transition-all"
+            onClick={() => setShowYoutubeModal(true)}
+            className="px-4 py-2 bg-red-600 hover:bg-red-500 rounded-xl text-white text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2 shadow-lg shadow-red-600/20"
           >
-            DOWNLOAD HD THUMBNAIL
+            <YoutubeIcon className="w-4 h-4" />
+            Publish Episode
           </button>
         )}
       </div>
 
-      <div className="w-full relative group aspect-video rounded-2xl overflow-hidden bg-black shadow-inner border border-gray-800">
+      <div className="w-full relative group aspect-video rounded-[2rem] overflow-hidden bg-black shadow-2xl border border-gray-800">
         {videoUrl ? (
           <video
             ref={videoRef}
             src={videoUrl}
             controls
-            autoPlay
-            loop
             className="w-full h-full object-contain"
           />
         ) : (
-          <div className="w-full h-full relative">
+          <div className="w-full h-full relative cursor-pointer" onClick={togglePlayback}>
             <img 
               src={slideshowImages[currentSlide]} 
-              alt={`Step ${currentSlide + 1}`} 
-              className="w-full h-full object-cover transition-opacity duration-1000"
+              alt="Scene" 
+              className="w-full h-full object-cover transition-opacity duration-300"
             />
-            <div className="absolute top-4 left-4 bg-black/60 backdrop-blur px-3 py-1 rounded-full text-[10px] font-bold text-white border border-white/10">
-              SLIDE {currentSlide + 1} OF {slideshowImages.length}
-            </div>
-            <div className="absolute inset-x-0 bottom-0 h-24 bg-gradient-to-t from-black/90 to-transparent flex items-end p-6">
-              <div className="w-full flex items-center gap-4">
-                <div className="flex-grow h-1.5 bg-gray-800 rounded-full overflow-hidden">
-                   <div 
-                     className="h-full bg-indigo-500 transition-all duration-300" 
-                     style={{ width: `${((currentSlide + 1) / slideshowImages.length) * 100}%` }}
-                   />
+            {!isPlaying && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/50 backdrop-blur-sm transition-all group-hover:bg-black/30">
+                <div className="w-20 h-20 bg-white text-black rounded-full flex items-center justify-center shadow-2xl scale-110 active:scale-95 transition-all">
+                   <PlusIcon className="w-8 h-8 rotate-45" />
                 </div>
+                <p className="mt-6 text-white font-black uppercase tracking-[0.4em] text-[10px]">Preview Broadcast</p>
+              </div>
+            )}
+            <div className="absolute top-6 left-6 flex gap-2">
+              <div className="bg-black/80 backdrop-blur-md px-4 py-1.5 rounded-full text-[10px] font-black text-white border border-white/10 shadow-xl uppercase tracking-widest">
+                SCENE {currentSlide + 1} / {slideshowImages.length}
               </div>
             </div>
+            {isPlaying && (
+              <div className="absolute bottom-6 left-6 right-6">
+                <div className="w-full h-1 bg-white/10 rounded-full overflow-hidden">
+                  <div 
+                    className="h-full bg-indigo-500 transition-all duration-300" 
+                    style={{width: `${(currentSlide / slideshowImages.length) * 100}%`}}
+                  />
+                </div>
+              </div>
+            )}
           </div>
         )}
         
         {audioUrl && (
-          <audio 
-            ref={audioRef} 
-            src={audioUrl} 
-            autoPlay 
-            controls={!videoUrl} 
-            className={videoUrl ? "hidden" : "absolute bottom-12 right-6 opacity-60 hover:opacity-100 transition-all scale-75 origin-right"} 
-          />
+          <audio ref={audioRef} src={audioUrl} className="hidden" onEnded={() => setIsPlaying(false)} />
         )}
 
         {isExporting && (
-          <div className="absolute inset-0 bg-black/90 flex flex-col items-center justify-center z-50">
-            <div className="w-64 h-2 bg-gray-800 rounded-full overflow-hidden mb-4">
-              <div className="h-full bg-indigo-500 transition-all" style={{width: `${exportProgress}%`}}></div>
+          <div className="absolute inset-0 bg-black/95 flex flex-col items-center justify-center z-50 p-12 text-center">
+            <div className="w-full max-w-sm space-y-8">
+              <div className="relative">
+                <div className="w-full h-3 bg-gray-900 rounded-full overflow-hidden border border-white/5">
+                  <div className="h-full bg-indigo-500 transition-all duration-300 shadow-[0_0_20px_rgba(99,102,241,0.6)]" style={{width: `${exportProgress}%`}}></div>
+                </div>
+                <div className="mt-4 flex justify-between text-[10px] font-black text-gray-500 uppercase tracking-widest">
+                  <span>Rendering</span>
+                  <span>{exportProgress}%</span>
+                </div>
+              </div>
+              <div className="space-y-2">
+                <p className="text-white font-bold text-sm tracking-tight">{exportStatus}</p>
+                <p className="text-[10px] text-gray-500 uppercase tracking-widest font-bold animate-pulse">Encoding high-fidelity broadcast master...</p>
+              </div>
             </div>
-            <p className="text-white font-bold animate-pulse text-sm">RENDERING HD MASTER: {exportProgress}%</p>
           </div>
         )}
       </div>
 
       {exportedVideoUrl && (
-        <div className="w-full p-4 bg-indigo-600/10 border border-indigo-500/30 rounded-xl flex items-center justify-between animate-fade-in">
-          <p className="text-sm font-medium text-indigo-300">Video Master Exported Successfully</p>
-          <a href={exportedVideoUrl} download="tutorial_master_hd.webm" className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold transition-all">
-            DOWNLOAD MP4 (WEBM)
-          </a>
-        </div>
-      )}
-
-      {sources && sources.length > 0 && (
-        <div className="w-full bg-black/40 p-4 rounded-xl border border-gray-800">
-          <h3 className="text-[10px] uppercase tracking-widest font-bold text-gray-500 mb-2">Verified Grounding</h3>
-          <div className="flex flex-wrap gap-3">
-            {sources.map((source, i) => (
-              <a key={i} href={source.uri} target="_blank" rel="noopener noreferrer" className="text-xs text-indigo-400 hover:text-indigo-300 underline transition-colors">
-                {source.title.length > 40 ? source.title.substring(0, 40) + '...' : source.title}
-              </a>
-            ))}
+        <div className="w-full p-5 bg-indigo-600/10 border border-indigo-500/20 rounded-2xl flex items-center justify-between animate-fade-in">
+          <div className="flex items-center gap-4">
+            <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center text-white font-bold text-xs">HQ</div>
+            <div>
+              <p className="text-sm font-bold text-indigo-300">Broadcast Master Ready</p>
+              <p className="text-[10px] text-gray-500 uppercase font-black tracking-widest">Final encoded file available</p>
+            </div>
           </div>
+          <a href={exportedVideoUrl} download={`studio_production_${Date.now()}.webm`} className="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all shadow-lg">
+            Download Final
+          </a>
         </div>
       )}
 
       <canvas ref={canvasRef} className="hidden" />
 
-      <div className="flex flex-wrap justify-center gap-3 w-full">
-        <button
-          onClick={onRetry}
-          className="flex-1 flex items-center justify-center gap-2 px-6 py-4 bg-gray-800 hover:bg-gray-700 text-white font-semibold rounded-2xl transition-all border border-gray-700">
-          <ArrowPathIcon className="w-4 h-4" />
-          Regenerate
+      <div className="flex flex-wrap justify-center gap-4 w-full">
+        <button onClick={onRetry} className="flex-1 flex items-center justify-center gap-2 px-6 py-4 bg-gray-800 hover:bg-gray-700 text-white font-bold rounded-2xl transition-all border border-gray-700 uppercase text-[10px] tracking-widest">
+           <ArrowPathIcon className="w-4 h-4" /> Regenerate
         </button>
         {!videoUrl && !exportedVideoUrl && (
-          <button
-            onClick={handleExportHD}
-            className="flex-1 flex items-center justify-center gap-2 px-6 py-4 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold rounded-2xl transition-all shadow-lg hover:shadow-indigo-500/30">
+          <button onClick={handleExportHD} className="flex-[2] flex items-center justify-center gap-2 px-6 py-4 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-2xl transition-all shadow-2xl hover:shadow-indigo-500/40 uppercase text-[10px] tracking-widest">
             <TvIcon className="w-4 h-4" />
-            Export HD Video
+            Export High-Speed Master
           </button>
         )}
-        {videoUrl && canExtend && (
-          <button
-            onClick={onExtend}
-            className="flex-1 flex items-center justify-center gap-2 px-6 py-4 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold rounded-2xl transition-all shadow-lg hover:shadow-indigo-500/30">
-            <FilmIcon className="w-4 h-4" />
-            Extend Video
-          </button>
-        )}
-        <button
-          onClick={onNewVideo}
-          className="flex-1 flex items-center justify-center gap-2 px-6 py-4 bg-purple-600 hover:bg-purple-500 text-white font-semibold rounded-2xl transition-all shadow-lg hover:shadow-purple-500/30">
-          <PlusIcon className="w-4 h-4" />
-          Create New
+        <button onClick={onNewVideo} className="flex-1 flex items-center justify-center gap-2 px-6 py-4 bg-transparent border border-gray-800 hover:bg-gray-800 text-gray-400 font-bold rounded-2xl transition-all uppercase text-[10px] tracking-widest">
+          <PlusIcon className="w-4 h-4" /> New Studio Project
         </button>
       </div>
     </div>

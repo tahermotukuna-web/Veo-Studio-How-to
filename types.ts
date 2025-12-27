@@ -6,10 +6,17 @@
 import {Video} from '@google/genai';
 
 export enum AppState {
+  AUTH,
   IDLE,
   LOADING,
   SUCCESS,
   ERROR,
+}
+
+export enum ContentCategory {
+  HOW_TO = 'How-To Guide',
+  DRAMA_REVIEW = 'Drama Serial Review',
+  PRICE_IN_BD = 'Price in Bangladesh',
 }
 
 export enum TutorialType {
@@ -54,8 +61,15 @@ export interface GroundingSource {
   uri: string;
 }
 
+export interface YouTubeMetadata {
+  title: string;
+  description: string;
+  tags: string[];
+}
+
 export interface GenerateVideoParams {
   prompt: string;
+  category: ContentCategory;
   model: VeoModel;
   aspectRatio: AspectRatio;
   resolution: Resolution;
@@ -69,6 +83,7 @@ export interface GenerateVideoParams {
   inputVideoObject?: Video | null;
   isLooping?: boolean;
   isSmartTutorial?: boolean;
+  isDeepDive?: boolean;
   hasVoiceover?: boolean;
   voiceName?: string;
 }
@@ -84,4 +99,5 @@ export interface VideoGenerationResult {
   sources?: GroundingSource[];
   tutorialType: TutorialType;
   fullScript?: string;
+  youtubeMetadata?: YouTubeMetadata;
 }
