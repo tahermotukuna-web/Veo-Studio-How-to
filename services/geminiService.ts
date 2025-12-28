@@ -57,14 +57,42 @@ async function generateBasicSlideshow(ai: any, params: GenerateVideoParams): Pro
   const isDrama = params.category === ContentCategory.DRAMA_REVIEW;
   const isPriceBD = params.category === ContentCategory.PRICE_IN_BD;
   
-  // Adjusted segment counts for target durations
-  const stepCount = isDrama ? 25 : (isPriceBD ? 12 : (params.isDeepDive ? 15 : 7));
+  const stepCount = isDrama ? 35 : (isPriceBD ? 20 : (params.isDeepDive ? 15 : 8));
   
+  let groundingSources: GroundingSource[] = [];
+  let researchContext = "";
+
+  // 1. Research Step with Google Search
+  const researchResponse = await ai.models.generateContent({
+    model: 'gemini-3-pro-preview',
+    contents: `Research the latest information for: "${params.prompt}" in the context of ${params.category}. 
+               If it's a product, find current Price in Bangladesh (Official/Unofficial), full specifications, and key competitors.
+               If it's a drama, find latest review summaries and viewership ratings.
+               Current Date: ${currentFullDate}. 
+               Provide a detailed summary to be used for a 10-22 minute video script.`,
+    config: {
+      tools: [{ googleSearch: {} }]
+    }
+  });
+
+  researchContext = researchResponse.text;
+  
+  // Extract grounding chunks
+  const chunks = researchResponse.candidates?.[0]?.groundingMetadata?.groundingChunks;
+  if (chunks) {
+    groundingSources = chunks
+      .filter((c: any) => c.web)
+      .map((c: any) => ({
+        title: c.web.title || 'Source',
+        uri: c.web.uri
+      }));
+  }
+
   let scriptDetail = "";
   if (isDrama) {
-    scriptDetail = "ACT AS A BROADCAST TELEVISION CRITIC. This is a 22-MINUTE DRAMA REVIEW. Each of the 25 segments MUST have an EXTREMELY LENGTHY, professional script (230-260 words per segment). Total word count MUST exceed 5,500 words. Keep the pace steady and analytical.";
+    scriptDetail = "ACT AS A BROADCAST TELEVISION CRITIC. This is a 22-MINUTE DRAMA REVIEW. Each of the 35 segments MUST have a lengthy, professional script (180-220 words per segment). Total word count MUST exceed 6,000 words.";
   } else if (isPriceBD) {
-    scriptDetail = "ACT AS A TECH ANALYST IN BANGLADESH. This is a 10-MINUTE PRODUCT VIDEO focused on 'Price in BD'. Each of the 12 segments MUST have a script of exactly 140-160 words. You MUST mention the current price in BDT (Bangladeshi Taka) in almost every segment. Include full specs, a hands-on review summary, and a detailed comparison with two similar products popular in the Bangladesh market. Highlight if the price is for the Official or Unofficial variant.";
+    scriptDetail = "ACT AS A TECH ANALYST IN BANGLADESH. This is a 10-MINUTE PRODUCT VIDEO focused on 'Price in BD'. Each of the 20 segments MUST have a script of 150-170 words. Mention the current price in BDT (Bangladeshi Taka) in every scene. Use the researched latest prices.";
   } else if (params.isDeepDive) {
     scriptDetail = "Provide a very detailed, comprehensive explanation (170-200 words per segment).";
   } else {
@@ -73,20 +101,20 @@ async function generateBasicSlideshow(ai: any, params: GenerateVideoParams): Pro
 
   const planResponse = await ai.models.generateContent({
     model: 'gemini-3-pro-preview',
-    contents: `Create a professional ${stepCount}-segment production storyboard for: "${params.prompt}" in the category: ${params.category}. 
-               CURRENT DATE: ${currentFullDate}.
+    contents: `Create a massive ${stepCount}-segment production storyboard for: "${params.prompt}" based on this researched context:
                
+               CONTEXT: ${researchContext}
+
                Storyboard Layout:
-               1. THUMBNAIL: High-impact cinematic composite. ${isPriceBD ? 'Must include large text highlighting the product name and its Price in Bangladesh (BDT).' : ''}
+               1. THUMBNAIL: High-impact cinematic composite. ${isPriceBD ? 'Must show large BDT price text.' : ''}
                2. INTRO: Professional hook.
-               3-${stepCount - 2}. DEEP DIVE: ${isPriceBD ? 'Specs, Performance, and Comparison sections.' : 'Core analytical segments.'}
+               3-${stepCount - 2}. CORE ANALYTICAL ARC: Extreme visual and narrative depth.
                ${stepCount - 1}. FINAL VERDICT / PRICE SUMMARY.
                ${stepCount}. OUTRO & CTA.
 
                ${scriptDetail}
 
-               SEO METADATA: 
-               Provide a clickable Title (max 100 chars), a Description with timestamps for all ${stepCount} parts, and 15 relevant Tags.`,
+               Provide metadata: Title, Description (with timestamps), and 20 Tags.`,
     config: {
       responseMimeType: "application/json",
       responseSchema: {
@@ -123,12 +151,11 @@ async function generateBasicSlideshow(ai: any, params: GenerateVideoParams): Pro
   let fullScript = "";
   let thumbnailUrl = "";
 
-  // Process all segments sequentially
   for (let i = 0; i < storyboard.length; i++) {
     const step = storyboard[i];
     const promptPrefix = i === 0 
-      ? `YouTube high-impact professional thumbnail, DSLR quality, cinematic lighting. ${isPriceBD ? 'Include visual elements related to smartphones/tech and Bangladeshi currency symbols.' : ''} Subject:` 
-      : `High-fidelity professional product/scene photography, 8k resolution, neutral balanced color, sharp focus. Context:`;
+      ? `Ultra-HD YouTube thumbnail, DSLR quality. ${isPriceBD ? 'Include visual price tags and BDT symbols.' : ''} Subject:` 
+      : `High-fidelity professional cinematography, sharp focus. Context:`;
     
     const imgResponse = await ai.models.generateContent({
       model: 'gemini-2.5-flash-image',
@@ -143,13 +170,11 @@ async function generateBasicSlideshow(ai: any, params: GenerateVideoParams): Pro
         thumbnailUrl = b64;
       } else {
         slideshowImages.push(b64);
-        // Add natural spoken pauses for the TTS engine
         fullScript += step.script + " ... [pause] ... ";
       }
     }
   }
 
-  // Generate Voiceover
   const speechResponse = await ai.models.generateContent({
     model: "gemini-2.5-flash-preview-tts",
     contents: [{ parts: [{ text: `Speak at a steady, professional informative pace: ${fullScript}` }] }],
@@ -176,7 +201,8 @@ async function generateBasicSlideshow(ai: any, params: GenerateVideoParams): Pro
     audioUrl,
     tutorialType: TutorialType.BASIC_SLIDESHOW,
     fullScript,
-    youtubeMetadata
+    youtubeMetadata,
+    sources: groundingSources
   };
 }
 
@@ -185,32 +211,44 @@ async function generateProVideo(ai: any, params: GenerateVideoParams): Promise<V
   let refinedPrompt = params.prompt;
   let ttsText = params.prompt;
   let youtubeMetadata: any;
+  let groundingSources: GroundingSource[] = [];
 
-  if (params.isSmartTutorial) {
-    const researchResponse = await ai.models.generateContent({
-      model: 'gemini-3-pro-preview',
-      contents: `High-End Studio Production for: "${params.prompt}" in category ${params.category}. 
-                 TODAY: ${currentFullDate}.
-                 Research this topic then output:
-                 PROMPT: [Ultra detailed cinematic scene prompt for Veo] 
-                 SCRIPT: [Exhaustive narration script to match ${params.category === ContentCategory.PRICE_IN_BD ? '10 minute' : 'long'} duration] 
-                 YOUTUBE_TITLE: [Title]
-                 YOUTUBE_DESC: [Description]
-                 YOUTUBE_TAGS: [Tags]`,
-      config: { tools: [{googleSearch: {}}] },
-    });
-    const text = researchResponse.text || '';
-    const promptMatch = text.match(/PROMPT:\s*([\s\S]*?)(?=SCRIPT:|$)/i);
-    const scriptMatch = text.match(/SCRIPT:\s*([\s\S]*?)(?=YOUTUBE_|$)/i);
-    const yTitle = text.match(/YOUTUBE_TITLE:\s*(.*)/i)?.[1];
-    const yDesc = text.match(/YOUTUBE_DESC:\s*([\s\S]*?)(?=YOUTUBE_TAGS|$)/i)?.[1];
-    const yTags = text.match(/YOUTUBE_TAGS:\s*(.*)/i)?.[1]?.split(',').map(t => t.trim());
+  const researchResponse = await ai.models.generateContent({
+    model: 'gemini-3-pro-preview',
+    contents: `High-End Studio Production Research for: "${params.prompt}" (${params.category}). 
+               TODAY: ${currentFullDate}.
+               Gather latest information and then output:
+               PROMPT: [Ultra detailed cinematic scene prompt for Veo] 
+               SCRIPT: [Exhaustive narration script] 
+               YOUTUBE_TITLE: [Title]
+               YOUTUBE_DESC: [Description]
+               YOUTUBE_TAGS: [Tags]`,
+    config: { tools: [{googleSearch: {}}] },
+  });
 
-    if (promptMatch) refinedPrompt = promptMatch[1].trim();
-    if (scriptMatch) ttsText = scriptMatch[1].trim();
-    if (yTitle && yDesc && yTags) {
-      youtubeMetadata = { title: yTitle.trim(), description: yDesc.trim(), tags: yTags };
-    }
+  const text = researchResponse.text || '';
+  
+  // Extract chunks
+  const chunks = researchResponse.candidates?.[0]?.groundingMetadata?.groundingChunks;
+  if (chunks) {
+    groundingSources = chunks
+      .filter((c: any) => c.web)
+      .map((c: any) => ({
+        title: c.web.title || 'Source',
+        uri: c.web.uri
+      }));
+  }
+
+  const promptMatch = text.match(/PROMPT:\s*([\s\S]*?)(?=SCRIPT:|$)/i);
+  const scriptMatch = text.match(/SCRIPT:\s*([\s\S]*?)(?=YOUTUBE_|$)/i);
+  const yTitle = text.match(/YOUTUBE_TITLE:\s*(.*)/i)?.[1];
+  const yDesc = text.match(/YOUTUBE_DESC:\s*([\s\S]*?)(?=YOUTUBE_TAGS|$)/i)?.[1];
+  const yTags = text.match(/YOUTUBE_TAGS:\s*(.*)/i)?.[1]?.split(',').map(t => t.trim());
+
+  if (promptMatch) refinedPrompt = promptMatch[1].trim();
+  if (scriptMatch) ttsText = scriptMatch[1].trim();
+  if (yTitle && yDesc && yTags) {
+    youtubeMetadata = { title: yTitle.trim(), description: yDesc.trim(), tags: yTags };
   }
 
   const generateVideoPayload: any = {
@@ -231,6 +269,7 @@ async function generateProVideo(ai: any, params: GenerateVideoParams): Promise<V
   const videoBlob = await videoRes.blob();
   const objectUrl = URL.createObjectURL(videoBlob);
 
+  let audioUrl: string | undefined;
   if (params.hasVoiceover) {
     const speechResponse = await ai.models.generateContent({
       model: "gemini-2.5-flash-preview-tts",
@@ -245,15 +284,7 @@ async function generateProVideo(ai: any, params: GenerateVideoParams): Promise<V
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({sampleRate: 24000});
       const audioBuffer = await decodeAudioData(decode(base64Audio), audioCtx, 24000, 1);
       const wavBlob = await audioBufferToWav(audioBuffer);
-      return {
-        objectUrl,
-        blob: videoBlob,
-        uri: videoObject.uri,
-        video: videoObject,
-        audioUrl: URL.createObjectURL(wavBlob),
-        tutorialType: TutorialType.PRO_VIDEO,
-        youtubeMetadata
-      };
+      audioUrl = URL.createObjectURL(wavBlob);
     }
   }
 
@@ -262,8 +293,10 @@ async function generateProVideo(ai: any, params: GenerateVideoParams): Promise<V
     blob: videoBlob,
     uri: videoObject.uri,
     video: videoObject,
+    audioUrl,
     tutorialType: TutorialType.PRO_VIDEO,
-    youtubeMetadata
+    youtubeMetadata,
+    sources: groundingSources
   };
 }
 
@@ -275,7 +308,7 @@ async function audioBufferToWav(buffer: AudioBuffer): Promise<Blob> {
   const channels = [];
   let i, sample, offset = 0, pos = 0;
   function setUint16(data: number) { view.setUint16(pos, data, true); pos += 2; }
-  function setUint32(data: number) { view.setUint32(pos, data, true); pos += 4; }
+  function setUint32(data: number) { view.setUint32(pos, pos, true); pos += 4; }
   setUint32(0x46464952); setUint32(length - 8); setUint32(0x45564157); setUint32(0x20746d66); setUint32(16); setUint16(1); setUint16(numOfChan); setUint32(buffer.sampleRate); setUint32(buffer.sampleRate * 2 * numOfChan); setUint16(numOfChan * 2); setUint16(16); setUint32(0x61746164); setUint32(length - pos - 4);
   for (i = 0; i < buffer.numberOfChannels; i++) channels.push(buffer.getChannelData(i));
   while (pos < length) {
